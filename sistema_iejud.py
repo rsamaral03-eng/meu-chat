@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# DATABASE & PERSISTENCE LAYER (SQLite for Cloud/Multi-user)
+# DATABASE & PERSISTENCE LAYER (SQLite)
 # ---------------------------------------------------------
 DB_FILE = "sistema_iejud_database.db"
 
@@ -56,7 +56,28 @@ def init_db():
         )
     """)
     
-    # Editable Metadata for Tasks (Providências / Prazos / Servidores)
+    # TCL Simulation History
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tcl_simulations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            pendentes INTEGER,
+            suspensos INTEGER,
+            baixados_12m INTEGER,
+            tcl_atual REAL,
+            baixas_descarte INTEGER,
+            novas_baixas INTEGER,
+            novos_processos INTEGER,
+            suspensos_var INTEGER,
+            novo_liq INTEGER,
+            novos_baixados_12m INTEGER,
+            tcl_projetada REAL,
+            dif_tcl REAL,
+            saved_by TEXT
+        )
+    """)
+
+    # Process Metadata (Providências / Prazos / Servidores)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS process_metadata (
             num_processo TEXT PRIMARY KEY,
@@ -68,7 +89,7 @@ def init_db():
         )
     """)
     
-    # Raw tables storage (JSON serialized for simplicity & instant persistence)
+    # Raw tables storage (JSON serialized)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS data_tables (
             table_name TEXT PRIMARY KEY,
@@ -90,15 +111,21 @@ def log_audit(username, action, details=""):
     conn.commit()
     conn.close()
 
+def sanitize_process_number(val):
+    if pd.isna(val):
+        return ""
+    val_str = str(val).split('.')[0].strip()
+    digits = ''.join(c for c in val_str if c.isdigit())
+    return digits.zfill(20) if digits else ""
+
 def save_data_table(table_name, df, username):
-    # Ensure process column is string formatted (preserving leading zeroes)
-    if "PROCESSOS" in df.columns:
-        df["PROCESSOS"] = df["PROCESSOS"].astype(str).str.zfill(20)
-    elif "Processo" in df.columns:
-        df["Processo"] = df["Processo"].astype(str).str.zfill(20)
+    df_copy = df.copy()
+    for col in ["PROCESSOS", "Processo", "Nº DO PROCESSO", "num_processo"]:
+        if col in df_copy.columns:
+            df_copy[col] = df_copy[col].apply(sanitize_process_number)
         
     conn = get_db()
-    data_json = df.to_json(orient="records", date_format="iso")
+    data_json = df_copy.to_json(orient="records", date_format="iso")
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("""
         INSERT INTO data_tables (table_name, data_json, last_updated, updated_by)
@@ -110,7 +137,7 @@ def save_data_table(table_name, df, username):
     """, (table_name, data_json, now_str, username))
     conn.commit()
     conn.close()
-    log_audit(username, f"Atualizou tabela {table_name}", f"Total de linhas: {len(df)}")
+    log_audit(username, f"Atualizou tabela {table_name}", f"Total de linhas: {len(df_copy)}")
 
 def load_data_table(table_name):
     conn = get_db()
@@ -118,15 +145,14 @@ def load_data_table(table_name):
     conn.close()
     if row and row["data_json"]:
         df = pd.read_json(io.StringIO(row["data_json"]))
-        # Re-ensure leading zero string format
-        if "PROCESSOS" in df.columns:
-            df["PROCESSOS"] = df["PROCESSOS"].astype(str).str.zfill(20)
-        elif "Processo" in df.columns:
-            df["Processo"] = df["Processo"].astype(str).str.zfill(20)
+        for col in ["PROCESSOS", "Processo", "Nº DO PROCESSO", "num_processo"]:
+            if col in df.columns:
+                df[col] = df[col].apply(sanitize_process_number)
         return df
     return pd.DataFrame()
 
 def save_process_metadata(num_processo, providencia, prazo, servidor, username):
+    num_clean = sanitize_process_number(num_processo)
     conn = get_db()
     conn.execute("""
         INSERT INTO process_metadata (num_processo, providencia, prazo, servidor_atribuido, updated_by, last_update)
@@ -137,7 +163,7 @@ def save_process_metadata(num_processo, providencia, prazo, servidor, username):
             servidor_atribuido=excluded.servidor_atribuido,
             updated_by=excluded.updated_by,
             last_update=CURRENT_TIMESTAMP
-    """, (num_processo, providencia, prazo, servidor, username))
+    """, (num_clean, providencia, prazo, servidor, username))
     conn.commit()
     conn.close()
 
@@ -146,7 +172,7 @@ def load_all_metadata():
     df = pd.read_sql_query("SELECT * FROM process_metadata", conn)
     conn.close()
     if not df.empty:
-        df["num_processo"] = df["num_processo"].astype(str).str.zfill(20)
+        df["num_processo"] = df["num_processo"].apply(sanitize_process_number)
     return df
 
 # ---------------------------------------------------------
@@ -208,13 +234,14 @@ menu = st.sidebar.radio(
     [
         "📊 Dashboard & Histórico IE-Jud",
         "🔮 Previsão de TCL",
+        "⚖️ Aptos para Baixa (Sentenças Terminativas)",
+        "📜 PAPJ (Processos Antigos)",
         "📂 TMT & Gestão de Acervo (4 Tabelas)",
         "⏳ Processos Parados (>120 Dias)",
         "📋 Histórico & Log de Alterações"
     ]
 )
 
-# HELPER MATH FUNCTIONS FOR IEJUD
 def calc_iejud(pp, m1, m2, iad, tcl, tmt):
     n_pp = 1.0 if pp <= 5.0 else max(0.0, 1 - (pp - 5)/10)
     n_m1 = min(1.0, m1 / 100)
@@ -282,11 +309,11 @@ if menu == "📊 Dashboard & Histórico IE-Jud":
         st.dataframe(history_df[['date_recorded', 'iejud_score', 'pp120', 'meta1', 'meta2', 'iad', 'tcl', 'tmt', 'updated_by']], use_container_width=True)
 
 # =========================================================
-# 2. MÓDULO: PREVISÃO DE TCL
+# 2. MÓDULO: PREVISÃO DE TCL (COM HISTÓRICO DE SIMULAÇÕES)
 # =========================================================
 elif menu == "🔮 Previsão de TCL":
     st.header("🔮 Simulador de Previsão Mensal da TCL")
-    st.caption("Calcule estimativas de variação da Taxa de Congestionamento Líquida para o próximo mês.")
+    st.caption("Calcule e grave o histórico de simulações da Taxa de Congestionamento Líquida.")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -296,15 +323,15 @@ elif menu == "🔮 Previsão de TCL":
         baixados_12m = st.number_input("Processos Baixados nos Últimos 12 Meses", value=2406, step=1)
         
         liq_atual = pendentes_at - suspensos_at
-        tcl_atual_calc = (liq_atual / (liq_atual + baixados_12m)) * 100
+        tcl_atual_calc = (liq_atual / (liq_atual + baixados_12m)) * 100 if (liq_atual + baixados_12m) > 0 else 0
         st.metric("TCL Atual Calculada", f"{tcl_atual_calc:.2f}%")
         
     with col2:
         st.subheader("⚙️ Variáveis de Projeção Mensal")
-        baixas_descarte = st.number_input("Baixas a Perder (Mês de 1 ano atrás que sairá dos 12M)", value=292, step=1)
+        baixas_descarte = st.number_input("Baixas a Perder (Mês de 1 ano atrás)", value=292, step=1)
         novas_baixas_est = st.number_input("Estimativa de Novas Baixas no Mês", value=220, step=1)
         novos_processos_est = st.number_input("Novos Processos que Entrarão na Vara", value=160, step=1)
-        suspensos_var = st.number_input("Variação de Suspensos (+ Novos Suspensos / - Dessuspensos)", value=0, step=1)
+        suspensos_var = st.number_input("Variação de Suspensos (+ Novos / - Dessuspensos)", value=0, step=1)
 
     # Calculation logic
     novos_baixados_12m = baixados_12m - baixas_descarte + novas_baixas_est
@@ -312,7 +339,7 @@ elif menu == "🔮 Previsão de TCL":
     novos_suspensos = suspensos_at + suspensos_var
     novo_liq = novos_pendentes - novos_suspensos
     
-    tcl_projetada = (novo_liq / (novo_liq + novos_baixados_12m)) * 100
+    tcl_projetada = (novo_liq / (novo_liq + novos_baixados_12m)) * 100 if (novo_liq + novos_baixados_12m) > 0 else 0
     dif_tcl = tcl_projetada - tcl_atual_calc
     
     st.divider()
@@ -322,19 +349,243 @@ elif menu == "🔮 Previsão de TCL":
     res2.metric("Baixas Acumuladas (12M)", f"{novos_baixados_12m} proc.")
     res3.metric("TCL Projetada", f"{tcl_projetada:.2f}%", delta=f"{dif_tcl:+.2f}%", delta_color="inverse")
 
+    if st.button("💾 Salvar Simulação no Histórico"):
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO tcl_simulations (
+                pendentes, suspensos, baixados_12m, tcl_atual, baixas_descarte, 
+                novas_baixas, novos_processos, suspensos_var, novo_liq, 
+                novos_baixados_12m, tcl_projetada, dif_tcl, saved_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            pendentes_at, suspensos_at, baixados_12m, round(tcl_atual_calc, 2),
+            baixas_descarte, novas_baixas_est, novos_processos_est, suspensos_var,
+            novo_liq, novos_baixados_12m, round(tcl_projetada, 2), round(dif_tcl, 2),
+            st.session_state.username
+        ))
+        conn.commit()
+        conn.close()
+        log_audit(st.session_state.username, "Salvou simulação de TCL", f"TCL Projetada: {tcl_projetada:.2f}%")
+        st.success("Simulação salva com sucesso!")
+        st.rerun()
+
+    st.divider()
+    st.subheader("📜 Histórico de Simulações Salvas")
+    conn = get_db()
+    tcl_hist_df = pd.read_sql_query("SELECT * FROM tcl_simulations ORDER BY id DESC", conn)
+    conn.close()
+    if not tcl_hist_df.empty:
+        st.dataframe(tcl_hist_df, use_container_width=True)
+    else:
+        st.info("Nenhuma simulação salva ainda.")
+
 # =========================================================
-# 3. MÓDULO: TMT E GESTÃO DE ACERVO (4 TABELAS)
+# 3. MÓDULO: APTOS PARA BAIXA (SENTENÇAS TERMINATIVAS VS ACERVO)
+# =========================================================
+elif menu == "⚖️ Aptos para Baixa (Sentenças Terminativas)":
+    st.header("⚖️ Processos Aptos para Baixa (Comparação de Acervo Ativo)")
+    st.caption("Cruza o Acervo Ativo com Processos Sentenciados por Sentença Terminativa e divide igualitariamente entre Servidor 3 e Servidor 4.")
+
+    c_up1, c_up2 = st.columns(2)
+    with c_up1:
+        u_acervo = st.file_uploader("Upload ACERVO ATIVO (.xlsx)", type=["xlsx", "xls"], key="up_acervo")
+    with c_up2:
+        u_sentenciados = st.file_uploader("Upload PROCESSOS SENTENCIADOS (.xlsx)", type=["xlsx", "xls"], key="up_sentenciados")
+
+    if u_acervo:
+        df_ac = pd.read_excel(u_acervo, header=2 if "Unnamed" in str(pd.read_excel(u_acervo).columns[0]) else 0)
+        save_data_table("acervo_ativo", df_ac, st.session_state.username)
+        st.success("Acervo Ativo atualizado com sucesso!")
+        st.rerun()
+
+    if u_sentenciados:
+        df_sn = pd.read_excel(u_sentenciados)
+        save_data_table("processos_sentenciados", df_sn, st.session_state.username)
+        st.success("Processos Sentenciados atualizados com sucesso!")
+        st.rerun()
+
+    df_acervo = load_data_table("acervo_ativo")
+    df_sent = load_data_table("processos_sentenciados")
+
+    if not df_acervo.empty and not df_sent.empty:
+        # Define terminal movement keywords
+        keywords = [
+            "abandono", "improcedência", "improcedencia", "decadência", "decadencia", "prescrição", "prescricao",
+            "perda do objeto", "perda de objeto", "pressuposto", "desistência", "desistencia", 
+            "condições da ação", "condicoes da acao", "cancelamento de distribuição", "cancelamento de distribuicao",
+            "homologação", "homologacao", "indeferimento", "paralisação", "paralisacao", "perempção", "perempcao",
+            "coisa julgada", "litispendência", "litispendencia"
+        ]
+        
+        def is_terminal_mov(mov):
+            mov_str = str(mov).lower()
+            if "procedência" in mov_str and "improcedência" not in mov_str and "improcedencia" not in mov_str:
+                return False
+            return any(kw in mov_str for kw in keywords)
+
+        mov_col = "MOVIMENTO" if "MOVIMENTO" in df_sent.columns else df_sent.columns[-1]
+        proc_col_sent = "Nº DO PROCESSO" if "Nº DO PROCESSO" in df_sent.columns else "PROCESSOS"
+        proc_col_ac = "Nº DO PROCESSO" if "Nº DO PROCESSO" in df_acervo.columns else "PROCESSOS"
+
+        df_sent["MOV_CLEAN"] = df_sent[mov_col].astype(str)
+        df_sent_term = df_sent[df_sent["MOV_CLEAN"].apply(is_terminal_mov)].copy()
+
+        df_acervo["PROC_CLEAN"] = df_acervo[proc_col_ac].apply(sanitize_process_number)
+        df_sent_term["PROC_CLEAN"] = df_sent_term[proc_col_sent].apply(sanitize_process_number)
+
+        # Inner join: Process in Active Inventory AND in Terminal Sentences
+        aptos = df_sent_term[df_sent_term["PROC_CLEAN"].isin(df_acervo["PROC_CLEAN"])].copy()
+        aptos = aptos.drop_duplicates(subset=["PROC_CLEAN"]).reset_index(drop=True)
+
+        if not aptos.empty:
+            meta_df = load_all_metadata()
+            meta_dict = {}
+            if not meta_df.empty:
+                for idx, r in meta_df.iterrows():
+                    meta_dict[r["num_processo"]] = {
+                        "providencia": r.get("providencia", ""),
+                        "servidor": r.get("servidor_atribuido", "")
+                    }
+
+            # Prepare columns
+            aptos["Nº DO PROCESSO"] = aptos["PROC_CLEAN"]
+            aptos["TIPO DE MOVIMENTO/SENTENÇA"] = aptos["MOV_CLEAN"]
+            
+            # Divide equally between Servidor 3 and Servidor 4 if not assigned yet
+            servidores_list = []
+            providencias_list = []
+            for idx, r in aptos.iterrows():
+                p_num = r["Nº DO PROCESSO"]
+                saved_prov = meta_dict.get(p_num, {}).get("providencia", "")
+                saved_srv = meta_dict.get(p_num, {}).get("servidor", "")
+
+                if not saved_srv or saved_srv not in ["Servidor 3", "Servidor 4"]:
+                    assigned_srv = "Servidor 3" if (idx % 2 == 0) else "Servidor 4"
+                else:
+                    assigned_srv = saved_srv
+
+                providencias_list.append(saved_prov)
+                servidores_list.append(assigned_srv)
+
+            aptos["Providência"] = providencias_list
+            aptos["Servidor Responsável"] = servidores_list
+
+            disp_df = aptos[["Nº DO PROCESSO", "TIPO DE MOVIMENTO/SENTENÇA", "Providência", "Servidor Responsável"]].copy()
+
+            st.subheader(f"📋 Processos Aptos para Baixa Identificados ({len(disp_df)} processos)")
+            
+            edited_aptos = st.data_editor(
+                disp_df,
+                column_config={
+                    "Nº DO PROCESSO": st.column_config.TextColumn("Nº do Processo", disabled=True),
+                    "TIPO DE MOVIMENTO/SENTENÇA": st.column_config.TextColumn("Tipo de Movimento/Sentença", disabled=True),
+                    "Providência": st.column_config.TextColumn("Providência (Editável)"),
+                    "Servidor Responsável": st.column_config.SelectboxColumn("Servidor Responsável", options=["Servidor 3", "Servidor 4"])
+                },
+                key="editor_aptos_baixa",
+                use_container_width=True,
+                num_rows="fixed"
+            )
+
+            c_btn1, c_btn2 = st.columns([1.5, 4])
+            with c_btn1:
+                if st.button("💾 Salvar Providências e Servidores"):
+                    for idx, r in edited_aptos.iterrows():
+                        p_num = str(r["Nº DO PROCESSO"])
+                        prov = str(r["Providência"]) if pd.notna(r["Providência"]) else ""
+                        srv = str(r["Servidor Responsável"]) if pd.notna(r["Servidor Responsável"]) else ""
+                        save_process_metadata(p_num, prov, "", srv, st.session_state.username)
+                    st.success("Alterações salvas permanentemente!")
+                    st.rerun()
+            
+            with c_btn2:
+                # Excel download buffer
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    edited_aptos.to_excel(writer, index=False, sheet_name="Aptos_Para_Baixa")
+                buffer.seek(0)
+                st.download_button(
+                    label="📥 Baixar Relatório de Processos Aptos para Baixa (Excel)",
+                    data=buffer,
+                    file_name=f"Relatorio_Aptos_Para_Baixa_{datetime.date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        else:
+            st.info("Nenhum processo com sentença terminativa encontrado no acervo ativo.")
+    else:
+        st.warning("Faça o upload do ACERVO ATIVO e dos PROCESSOS SENTENCIADOS para visualizar esta comparação.")
+
+# =========================================================
+# 4. MÓDULO: PAPJ (PROCESSOS ANTIGOS PENDENTES DE JULGAMENTO)
+# =========================================================
+elif menu == "📜 PAPJ (Processos Antigos)":
+    st.header("📜 PAPJ - Processos Antigos Pendentes de Julgamento")
+    st.caption("Upload e acompanhamento dos processos antigos com salvamento contínuo de Providências.")
+
+    u_papj = st.file_uploader("Upload Planilha PAPJ (.xlsx)", type=["xlsx", "xls"], key="up_papj")
+    if u_papj:
+        df_p = pd.read_excel(u_papj)
+        save_data_table("papj_table", df_p, st.session_state.username)
+        st.success("Planilha PAPJ carregada e salva com sucesso!")
+        st.rerun()
+
+    df_papj_raw = load_data_table("papj_table")
+    if not df_papj_raw.empty:
+        proc_col = "Nº DO PROCESSO" if "Nº DO PROCESSO" in df_papj_raw.columns else df_papj_raw.columns[0]
+        classe_col = "CLASSE" if "CLASSE" in df_papj_raw.columns else df_papj_raw.columns[1]
+        conc_col = "TIPO CONCLUSAO" if "TIPO CONCLUSAO" in df_papj_raw.columns else "TIPO DE CONCLUSÃO"
+
+        df_papj_raw["Nº DO PROCESSO"] = df_papj_raw[proc_col].apply(sanitize_process_number)
+        df_papj_raw["CLASSE"] = df_papj_raw[classe_col].fillna("") if classe_col in df_papj_raw.columns else ""
+        df_papj_raw["Tipo de Conclusão"] = df_papj_raw[conc_col].fillna("") if conc_col in df_papj_raw.columns else ""
+
+        meta_df = load_all_metadata()
+        meta_dict = {}
+        if not meta_df.empty:
+            for idx, r in meta_df.iterrows():
+                meta_dict[r["num_processo"]] = r.get("providencia", "")
+
+        df_papj_raw["Providências"] = df_papj_raw["Nº DO PROCESSO"].apply(lambda x: meta_dict.get(x, ""))
+
+        disp_papj = df_papj_raw[["Nº DO PROCESSO", "CLASSE", "Tipo de Conclusão", "Providências"]].copy()
+
+        st.subheader(f"📋 Tabela de Processos PAPJ ({len(disp_papj)} processos)")
+        
+        edited_papj = st.data_editor(
+            disp_papj,
+            column_config={
+                "Nº DO PROCESSO": st.column_config.TextColumn("Nº do Processo", disabled=True),
+                "CLASSE": st.column_config.TextColumn("Classe", disabled=True),
+                "Tipo de Conclusão": st.column_config.TextColumn("Tipo de Conclusão", disabled=True),
+                "Providências": st.column_config.TextColumn("Providências (Editável)")
+            },
+            key="editor_papj",
+            use_container_width=True,
+            num_rows="fixed"
+        )
+
+        if st.button("💾 Salvar Providências do PAPJ"):
+            for idx, r in edited_papj.iterrows():
+                p_num = str(r["Nº DO PROCESSO"])
+                prov = str(r["Providências"]) if pd.notna(r["Providências"]) else ""
+                save_process_metadata(p_num, prov, "", "", st.session_state.username)
+            st.success("Providências do PAPJ salvas com sucesso!")
+            st.rerun()
+    else:
+        st.info("Nenhuma planilha PAPJ enviada ainda.")
+
+# =========================================================
+# 5. MÓDULO: TMT E GESTÃO DE ACERVO (4 TABELAS)
 # =========================================================
 elif menu == "📂 TMT & Gestão de Acervo (4 Tabelas)":
     st.header("📂 Gestão de TMT & Divisão do Acervo")
     st.caption("Upload inteligente: preserva providências, prazos e atribuições de servidores sem sobrescrever.")
     
-    # Metadata map
     meta_df = load_all_metadata()
     meta_dict = {}
     if not meta_df.empty:
         for idx, r in meta_df.iterrows():
-            meta_dict[str(r["num_processo"]).zfill(20)] = {
+            meta_dict[r["num_processo"]] = {
                 "providencia": r.get("providencia", ""),
                 "prazo": r.get("prazo", ""),
                 "servidor": r.get("servidor_atribuido", "")
@@ -356,19 +607,16 @@ elif menu == "📂 TMT & Gestão de Acervo (4 Tabelas)":
         
         if u_sec:
             df_s = pd.read_excel(u_sec, dtype=str)
-            df_s["PROCESSOS"] = df_s["PROCESSOS"].astype(str).str.zfill(20)
             save_data_table("tmt_secretaria", df_s, st.session_state.username)
             st.success("Planilha de Secretaria carregada e salva com sucesso!")
             st.rerun()
             
         if u_gab:
             df_g = pd.read_excel(u_gab, dtype=str)
-            df_g["PROCESSOS"] = df_g["PROCESSOS"].astype(str).str.zfill(20)
             save_data_table("tmt_gabinete", df_g, st.session_state.username)
             st.success("Planilha de Gabinete carregada e salva com sucesso!")
             st.rerun()
 
-    # Load raw stored tables
     df_raw_sec = load_data_table("tmt_secretaria")
     df_raw_gab = load_data_table("tmt_gabinete")
 
@@ -376,13 +624,13 @@ elif menu == "📂 TMT & Gestão de Acervo (4 Tabelas)":
         if df.empty:
             return df
         df = df.copy()
-        df["PROCESSOS"] = df["PROCESSOS"].astype(str).str.zfill(20)
-        df["Providência"] = df["PROCESSOS"].apply(lambda x: meta_dict.get(x, {}).get("providencia", ""))
-        df["Prazo"] = df["PROCESSOS"].apply(lambda x: meta_dict.get(x, {}).get("prazo", ""))
-        df["Servidor Atribuído"] = df["PROCESSOS"].apply(lambda x: meta_dict.get(x, {}).get("servidor", ""))
+        proc_col = "PROCESSOS" if "PROCESSOS" in df.columns else df.columns[0]
+        df[proc_col] = df[proc_col].apply(sanitize_process_number)
+        df["Providência"] = df[proc_col].apply(lambda x: meta_dict.get(x, {}).get("providencia", ""))
+        df["Prazo"] = df[proc_col].apply(lambda x: meta_dict.get(x, {}).get("prazo", ""))
+        df["Servidor Atribuído"] = df[proc_col].apply(lambda x: meta_dict.get(x, {}).get("servidor", ""))
         return df
 
-    # Helper renderer and saver for data editors
     def render_editable_section(df_sub, key_prefix):
         if df_sub.empty:
             st.warning("Nenhum processo encontrado nesta categoria. Faça o upload da planilha.")
@@ -412,7 +660,7 @@ elif menu == "📂 TMT & Gestão de Acervo (4 Tabelas)":
         
         if st.button("💾 Salvar Alterações de Providências/Prazos", key=f"btn_{key_prefix}"):
             for idx, r in edited_df.iterrows():
-                proc_num = str(r["PROCESSOS"]).zfill(20)
+                proc_num = sanitize_process_number(r["PROCESSOS"])
                 prov = str(r["Providência"]) if pd.notna(r["Providência"]) else ""
                 prz = str(r["Prazo"]) if pd.notna(r["Prazo"]) else ""
                 srv = str(r["Servidor Atribuído"]) if pd.notna(r["Servidor Atribuído"]) else ""
@@ -464,7 +712,7 @@ elif menu == "📂 TMT & Gestão de Acervo (4 Tabelas)":
                 st.dataframe(top30_sec[["PROCESSOS", "TEMPO TRAMITAÇÃO", "SITUACAO", "CLASSE"]], use_container_width=True)
 
 # =========================================================
-# 4. PROCESSOS PARADOS A MAIS DE 120 DIAS
+# 6. PROCESSOS PARADOS A MAIS DE 120 DIAS
 # =========================================================
 elif menu == "⏳ Processos Parados (>120 Dias)":
     st.header("⏳ Processos Parados a Mais de 120 Dias (PP+120)")
@@ -473,8 +721,6 @@ elif menu == "⏳ Processos Parados (>120 Dias)":
     u_pp = st.file_uploader("Upload Planilha Atualizada de PP+120", type=["xlsx", "xls"], key="pp120_up")
     if u_pp:
         df_pp = pd.read_excel(u_pp, dtype=str)
-        if "Processo" in df_pp.columns:
-            df_pp["Processo"] = df_pp["Processo"].astype(str).str.zfill(20)
         save_data_table("pp120_table", df_pp, st.session_state.username)
         st.success("Planilha de PP+120 atualizada com sucesso!")
         st.rerun()
@@ -487,7 +733,7 @@ elif menu == "⏳ Processos Parados (>120 Dias)":
         st.info("Nenhuma planilha de PP+120 enviada ainda.")
 
 # =========================================================
-# 5. HISTÓRICO & LOG DE ALTERAÇÕES
+# 7. HISTÓRICO & LOG DE ALTERAÇÕES
 # =========================================================
 elif menu == "📋 Histórico & Log de Alterações":
     st.header("📋 Log de Auditoria e Alterações do Sistema")
